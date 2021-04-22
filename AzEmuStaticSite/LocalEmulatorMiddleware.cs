@@ -2,9 +2,13 @@
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
 using System;
+using System.Buffers;
+using System.Collections.Generic;
 using System.Data.SqlClient;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -14,7 +18,7 @@ namespace AzEmuStaticSite
     {
         private readonly RequestDelegate _next;
         private readonly IConfiguration cfg;
-        private readonly SqlConnection connection;
+        private readonly string connectionString = DefaultConnStr;
 
         private readonly string indexDocument;
         private readonly string notFoundDocument;
@@ -25,8 +29,7 @@ namespace AzEmuStaticSite
             _next = next;
             this.cfg = cfg;
 
-            var connStr = cfg.GetConnectionString("Db") ?? DefaultConnStr;
-            this.connection = new SqlConnection(connStr);
+            this.connectionString = cfg.GetConnectionString("Db") ?? DefaultConnStr;
             this.indexDocument = cfg.GetValue<string>("indexDocument") ?? "index.html";
             this.notFoundDocument = cfg.GetValue<string>("notFoundDocument") ?? "404.html";
 
@@ -63,13 +66,23 @@ namespace AzEmuStaticSite
 
             try
             {
-                this.connection.Execute(command, webContainer);
+                using var connection = new SqlConnection(this.connectionString);
+                connection.Execute(command, webContainer);
             }
             catch (SqlException) {}
         }
 
         public async Task Invoke(HttpContext httpContext)
         {
+            httpContext.Response.Headers.Add("Access-Control-Allow-Methods", "GET");
+            httpContext.Response.Headers.Add("Access-Control-Allow-Origin", "*");
+
+            if (httpContext.Request.Method == HttpMethods.Options)
+            {
+                httpContext.Response.StatusCode = (int)HttpStatusCode.NoContent;
+                return;
+            }
+
             if(httpContext.Request.Method != HttpMethods.Get)
             {
                 httpContext.Response.StatusCode = 500;
@@ -97,7 +110,7 @@ namespace AzEmuStaticSite
                 }
             }
 
-            await WriteDocument(httpContext, Path.Combine(blob.DirectoryPath, blob.FileName ?? "1"));
+            await WriteBlob(httpContext, blob);
         }
 
         private async Task WriteNotFound(HttpContext httpContext)
@@ -108,7 +121,7 @@ namespace AzEmuStaticSite
 
             if(blob != null)
             {
-                await WriteDocument(httpContext, Path.Combine(blob.FileName, "1"));
+                await WriteBlob(httpContext, blob);
             }
             else
             {
@@ -116,12 +129,51 @@ namespace AzEmuStaticSite
             }
         }
 
-        private async Task WriteDocument(HttpContext httpContext, string filePath)
+        private ArrayPool<byte> blockCopyPool = ArrayPool<byte>.Shared;
+        private async Task WriteBlob(HttpContext httpContext, BlobInfo blobInfo)
         {
+            if(await this.TryCached(httpContext, blobInfo))
+            {
+                return;
+            }
+
+            FileStream currentFile = null;
+
+            await this.WriteBlobHeaders(httpContext, blobInfo);
+
             try
             {
-                using var f = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-                await f.CopyToAsync(httpContext.Response.Body);
+                var blocks = await this.GetBlocks(blobInfo);
+
+                string? currentFilePath = null;
+
+                foreach(var block in blocks)
+                {
+                    if(currentFilePath != block.FilePath)
+                    {
+                        if(currentFile != null)
+                        {
+                            await currentFile.DisposeAsync();
+                        }
+
+                        currentFile = File.Open(block.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    }
+
+                    if(currentFile == null)
+                    {
+                        throw new Exception("Error finding backing file for block");
+                    }
+
+                    var blockBuffer = blockCopyPool.Rent((int)block.Length);
+
+                    currentFile.Position = block.StartOffset;
+
+                    // Can't use Span overload since we're renting the buffer
+                    await currentFile.ReadAsync(blockBuffer, 0, (int)block.Length);
+
+                    await httpContext.Response.Body.WriteAsync(blockBuffer, 0, (int)block.Length);
+                }
+
                 await httpContext.Response.Body.FlushAsync();
                 return;
             }
@@ -131,9 +183,53 @@ namespace AzEmuStaticSite
             catch (DirectoryNotFoundException)
             {
             }
+            finally
+            {
+                currentFile?.Dispose();
+            }
 
             httpContext.Response.StatusCode = 500;
-            await this.WriteText(httpContext, $"File backing blob was not found at '{filePath}'");
+            await this.WriteText(httpContext, $"File backing blocks were not found for '{blobInfo.BlobName}'");
+        }
+
+        private async Task<bool> TryCached(HttpContext httpContext, BlobInfo blobInfo)
+        {
+            if(httpContext.Request.Headers.TryGetValue("If-Modified-Since", out var value)
+                && DateTime.TryParseExact(value.ToString(), "ddd, dd MM yyyy HH:mm:ss' GMT'", null, DateTimeStyles.None, out var ifModifiedSince)
+                && (blobInfo.LastModificationTime - ifModifiedSince).TotalMilliseconds <= 1000)
+            {
+                httpContext.Response.StatusCode = (int)HttpStatusCode.NotModified;
+                return true;
+            }
+
+            return false;
+        }
+
+        private async Task WriteBlobHeaders(HttpContext httpContext, BlobInfo blob)
+        {
+            var headers = httpContext.Response.Headers;
+
+            headers.Add("Content-Type", blob.ContentType);
+            headers.Add("Last-Modified", blob.LastModificationTime.ToString("ddd, dd MM yyyy HH:mm:ss 'GMT'"));
+
+            var metadataString = Encoding.UTF8.GetString(blob.ServiceMetadata);
+
+            var properties = metadataString
+                .Split("\r\n")
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Select(l => l.Split(':'))
+                .Where(m => m.Length >= 2 && !string.IsNullOrWhiteSpace(m[0]) && !string.IsNullOrWhiteSpace(m[1]))
+                .ToDictionary(m => m[0], m => m[1]);
+
+            if(properties.TryGetValue("CacheControl", out var cacheControl))
+            {
+                headers.Add("Cache-Control", cacheControl);
+            }
+
+            if (properties.TryGetValue("ContentDisposition", out var contentDisposition))
+            {
+                headers.Add("Content-Disposition", contentDisposition);
+            }
         }
 
         private async Task WriteText(HttpContext httpContext, string text)
@@ -146,10 +242,23 @@ namespace AzEmuStaticSite
 
         private async Task<BlobInfo?> GetBlobInfo(string path)
         {
+            using var connection = new SqlConnection(this.connectionString);
             var parameters = new { RequestedBlobName = path };
-            var blobs = await this.connection.QueryAsync<BlobInfo>("select top 1 * from Blob where ContainerName = '$web' and BlobName = @RequestedBlobName", parameters);
+            var blobs = await connection.QueryAsync<BlobInfo>("select top 1 * from Blob where ContainerName = '$web' and BlobName = @RequestedBlobName", parameters);
 
             return blobs.FirstOrDefault();
+        }
+
+        private async Task<IEnumerable<BlockInfo>> GetBlocks(BlobInfo blob)
+        {
+            using var connection = new SqlConnection(this.connectionString);
+            return await connection.QueryAsync<BlockInfo>(@"
+                select * from BlockData 
+                where AccountName = @AccountName
+                    and ContainerName = @ContainerName
+                    and BlobName = @BlobName
+                    and VersionTimestamp = @VersionTimestamp
+                    and IsCommitted = 1", blob);
         }
     }
 }

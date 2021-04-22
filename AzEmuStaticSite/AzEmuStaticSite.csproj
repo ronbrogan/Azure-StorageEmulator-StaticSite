@@ -8,7 +8,8 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>azblobweb</ToolCommandName>
     <PackageOutputPath>./nupkg</PackageOutputPath>
-    <Version>1.5.10.0</Version>
+    <Version>1.5.10.1</Version>
+    <RepositoryUrl>https://github.com/ronbrogan/Azure-StorageEmulator-StaticSite</RepositoryUrl>
   </PropertyGroup>
 
   <ItemGroup>
